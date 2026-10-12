@@ -53,6 +53,10 @@ Roles can take up to a few minutes to apply. Then enable the Logic App.
 
 Changing a setting later: Logic App > Logic app designer > **Parameters**. Redeploying the template overwrites them with the values you pass.
 
+## Flow diagrams
+
+[English](docs/nightly-active-users-60d-en.png) | [Hebrew / עברית](docs/nightly-active-users-60d-he.png) (editable `.excalidraw` files are in the same folder)
+
 ## What the flow does (6 steps)
 
 1. Read all members of the source group (ids only).
