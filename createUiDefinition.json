@@ -1,0 +1,111 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "basics": [
+      {
+        "name": "logicAppName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Logic App name",
+        "defaultValue": "la-active-users-sync",
+        "constraints": { "required": true, "regex": "^[a-zA-Z0-9-]{3,60}$", "validationMessage": "3-60 letters, digits or hyphens." }
+      }
+    ],
+    "steps": [
+      {
+        "name": "groups",
+        "label": "Groups",
+        "elements": [
+          {
+            "name": "sourceGroupId",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Source group object ID",
+            "toolTip": "Entra ID > Groups > your source group > Object Id.",
+            "constraints": { "required": true, "regex": "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$", "validationMessage": "Enter a GUID." }
+          },
+          {
+            "name": "activeGroupId",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Target (active users) group object ID",
+            "toolTip": "A cloud-only security group that this flow will maintain. Must differ from the source group.",
+            "constraints": { "required": true, "regex": "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$", "validationMessage": "Enter a GUID." }
+          },
+          {
+            "name": "inactivityDays",
+            "type": "Microsoft.Common.Slider",
+            "label": "Inactivity threshold (days)",
+            "min": 7, "max": 365, "defaultValue": 60, "showStepMarkers": false
+          },
+          {
+            "name": "maxRemovalPercent",
+            "type": "Microsoft.Common.Slider",
+            "label": "Removal safety cap (% of target group)",
+            "min": 1, "max": 100, "defaultValue": 10, "showStepMarkers": false
+          }
+        ]
+      },
+      {
+        "name": "reporting",
+        "label": "Reporting and schedule",
+        "elements": [
+          {
+            "name": "senderMailbox",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Sender mailbox",
+            "toolTip": "Mailbox the report is sent from (a shared mailbox is recommended).",
+            "constraints": { "required": true, "regex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", "validationMessage": "Enter an email address." }
+          },
+          {
+            "name": "notifyEmail",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Report recipient",
+            "constraints": { "required": true, "regex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", "validationMessage": "Enter an email address." }
+          },
+          {
+            "name": "scheduleHour",
+            "type": "Microsoft.Common.Slider",
+            "label": "Nightly run hour (0-23)",
+            "min": 0, "max": 23, "defaultValue": 2, "showStepMarkers": false
+          },
+          {
+            "name": "scheduleTimeZone",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Windows time zone name",
+            "defaultValue": "Israel Standard Time",
+            "constraints": { "required": true }
+          },
+          {
+            "name": "dryRun",
+            "type": "Microsoft.Common.CheckBox",
+            "label": "Dry run (report only, change nothing)",
+            "toolTip": "Keep checked for the first week.",
+            "defaultValue": true
+          },
+          {
+            "name": "afterDeploy",
+            "type": "Microsoft.Common.InfoBox",
+            "options": {
+              "icon": "Warning",
+              "text": "The Logic App is created Disabled. After deployment, grant its managed identity the Graph roles (see README: 'Grant permissions') and then enable it. deploy.ps1 does both automatically."
+            }
+          }
+        ]
+      }
+    ],
+    "outputs": {
+      "location": "[location()]",
+      "logicAppName": "[basics('logicAppName')]",
+      "sourceGroupId": "[steps('groups').sourceGroupId]",
+      "activeGroupId": "[steps('groups').activeGroupId]",
+      "inactivityDays": "[steps('groups').inactivityDays]",
+      "maxRemovalPercent": "[steps('groups').maxRemovalPercent]",
+      "senderMailbox": "[steps('reporting').senderMailbox]",
+      "notifyEmail": "[steps('reporting').notifyEmail]",
+      "scheduleHour": "[steps('reporting').scheduleHour]",
+      "scheduleTimeZone": "[steps('reporting').scheduleTimeZone]",
+      "dryRun": "[steps('reporting').dryRun]",
+      "state": "Disabled"
+    }
+  }
+}

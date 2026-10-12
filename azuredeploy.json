@@ -1,0 +1,1101 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Nightly sync of an 'active users' security group (sign-in within N days) from a source group."
+  },
+  "parameters": {
+    "logicAppName": {
+      "type": "string",
+      "defaultValue": "la-active-users-60d-sync",
+      "metadata": {
+        "description": "Name of the Logic App."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region."
+      }
+    },
+    "sourceGroupId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "metadata": {
+        "description": "Object ID (GUID) of the group whose members are evaluated."
+      }
+    },
+    "activeGroupId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "metadata": {
+        "description": "Object ID (GUID) of the group that the flow maintains (cloud-only security group)."
+      }
+    },
+    "senderMailbox": {
+      "type": "string",
+      "metadata": {
+        "description": "Mailbox the report is sent from (UPN or shared mailbox)."
+      }
+    },
+    "notifyEmail": {
+      "type": "string",
+      "metadata": {
+        "description": "Admin address that receives the report and failure alerts."
+      }
+    },
+    "inactivityDays": {
+      "type": "int",
+      "defaultValue": 60,
+      "minValue": 1,
+      "maxValue": 365,
+      "metadata": {
+        "description": "A user is inactive after this many days without sign-in."
+      }
+    },
+    "maxRemovalPercent": {
+      "type": "int",
+      "defaultValue": 10,
+      "minValue": 1,
+      "maxValue": 100,
+      "metadata": {
+        "description": "Safety cap: if removals exceed this percent of the active group, nobody is removed."
+      }
+    },
+    "dryRun": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "true = only report (CSV email). Set false to apply changes."
+      }
+    },
+    "scheduleHour": {
+      "type": "int",
+      "defaultValue": 2,
+      "minValue": 0,
+      "maxValue": 23,
+      "metadata": {
+        "description": "Hour of day the nightly run starts."
+      }
+    },
+    "scheduleTimeZone": {
+      "type": "string",
+      "defaultValue": "Israel Standard Time",
+      "metadata": {
+        "description": "Windows time zone name for the schedule."
+      }
+    },
+    "state": {
+      "type": "string",
+      "defaultValue": "Disabled",
+      "allowedValues": [
+        "Enabled",
+        "Disabled"
+      ],
+      "metadata": {
+        "description": "Keep Disabled until the Graph permissions are granted (deploy.ps1 does this)."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('logicAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "state": "[parameters('state')]",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "sourceGroupId": {
+              "type": "string",
+              "defaultValue": "00000000-0000-0000-0000-000000000000"
+            },
+            "activeGroupId": {
+              "type": "string",
+              "defaultValue": "00000000-0000-0000-0000-000000000000"
+            },
+            "senderMailbox": {
+              "type": "string",
+              "defaultValue": "sender@contoso.com"
+            },
+            "notifyEmail": {
+              "type": "string",
+              "defaultValue": "admins@contoso.com"
+            },
+            "inactivityDays": {
+              "type": "int",
+              "defaultValue": 60
+            },
+            "dryRun": {
+              "type": "bool",
+              "defaultValue": true
+            },
+            "maxRemovalPercent": {
+              "type": "int",
+              "defaultValue": 10
+            }
+          },
+          "triggers": {
+            "Recurrence_Nightly": {
+              "type": "Recurrence",
+              "recurrence": {
+                "frequency": "Day",
+                "interval": 1,
+                "timeZone": "[parameters('scheduleTimeZone')]",
+                "schedule": {
+                  "hours": [
+                    "[parameters('scheduleHour')]"
+                  ],
+                  "minutes": [
+                    0
+                  ]
+                }
+              }
+            }
+          },
+          "actions": {
+            "Initialize_variables": {
+              "type": "InitializeVariable",
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "sourceList",
+                    "type": "string",
+                    "value": ","
+                  },
+                  {
+                    "name": "activeIds",
+                    "type": "string",
+                    "value": ","
+                  },
+                  {
+                    "name": "addedRows",
+                    "type": "string",
+                    "value": ""
+                  },
+                  {
+                    "name": "removedRows",
+                    "type": "string",
+                    "value": ""
+                  },
+                  {
+                    "name": "failedChanges",
+                    "type": "integer",
+                    "value": 0
+                  },
+                  {
+                    "name": "currentMembers",
+                    "type": "string",
+                    "value": ","
+                  },
+                  {
+                    "name": "nextSource",
+                    "type": "string",
+                    "value": "@concat('https://graph.microsoft.com/v1.0/groups/', parameters('sourceGroupId'), '/members/microsoft.graph.user?$select=id&$top=999&$count=true')"
+                  },
+                  {
+                    "name": "nextActive",
+                    "type": "string",
+                    "value": "@concat('https://graph.microsoft.com/v1.0/users?$filter=signInActivity/lastSignInDateTime%20ge%20', formatDateTime(addDays(utcNow(), mul(parameters('inactivityDays'), -1)), 'yyyy-MM-ddTHH:mm:ssZ'), '&$select=id&$top=999')"
+                  },
+                  {
+                    "name": "nextNew",
+                    "type": "string",
+                    "value": "@concat('https://graph.microsoft.com/v1.0/users?$filter=createdDateTime%20ge%20', formatDateTime(addDays(utcNow(), mul(parameters('inactivityDays'), -1)), 'yyyy-MM-ddTHH:mm:ssZ'), '&$select=id&$top=999')"
+                  },
+                  {
+                    "name": "nextTarget",
+                    "type": "string",
+                    "value": "@concat('https://graph.microsoft.com/v1.0/groups/', parameters('activeGroupId'), '/members/microsoft.graph.user?$select=id&$top=999&$count=true')"
+                  }
+                ]
+              },
+              "runAfter": {}
+            },
+            "Scope_Try": {
+              "type": "Scope",
+              "actions": {
+                "Step1_Read_Source_Group_Members": {
+                  "type": "Until",
+                  "expression": "@equals(variables('nextSource'), '')",
+                  "limit": {
+                    "count": 200,
+                    "timeout": "PT2H"
+                  },
+                  "actions": {
+                    "Get_Source_Page": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "GET",
+                        "uri": "@variables('nextSource')",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://graph.microsoft.com"
+                        },
+                        "retryPolicy": {
+                          "type": "exponential",
+                          "count": 5,
+                          "interval": "PT20S",
+                          "minimumInterval": "PT10S",
+                          "maximumInterval": "PT5M"
+                        },
+                        "headers": {
+                          "ConsistencyLevel": "eventual"
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Select_Source_Ids": {
+                      "type": "Select",
+                      "inputs": {
+                        "from": "@coalesce(body('Get_Source_Page')?['value'], createArray())",
+                        "select": "@item()?['id']"
+                      },
+                      "runAfter": {
+                        "Get_Source_Page": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Add_To_Source_List": {
+                      "type": "AppendToStringVariable",
+                      "inputs": {
+                        "name": "sourceList",
+                        "value": "@concat(join(body('Select_Source_Ids'), ','), ',')"
+                      },
+                      "runAfter": {
+                        "Select_Source_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Set_Next_Source_Page": {
+                      "type": "SetVariable",
+                      "inputs": {
+                        "name": "nextSource",
+                        "value": "@coalesce(body('Get_Source_Page')?['@odata.nextLink'], '')"
+                      },
+                      "runAfter": {
+                        "Add_To_Source_List": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {}
+                },
+                "Step2_Read_Recently_Active_Users": {
+                  "type": "Until",
+                  "expression": "@equals(variables('nextActive'), '')",
+                  "limit": {
+                    "count": 500,
+                    "timeout": "PT2H"
+                  },
+                  "actions": {
+                    "Get_Active_Page": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "GET",
+                        "uri": "@variables('nextActive')",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://graph.microsoft.com"
+                        },
+                        "retryPolicy": {
+                          "type": "exponential",
+                          "count": 5,
+                          "interval": "PT20S",
+                          "minimumInterval": "PT10S",
+                          "maximumInterval": "PT5M"
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Keep_Only_Source_Members": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@coalesce(body('Get_Active_Page')?['value'], createArray())",
+                        "where": "@contains(variables('sourceList'), concat(',', item()?['id'], ','))"
+                      },
+                      "runAfter": {
+                        "Get_Active_Page": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Select_Active_Ids": {
+                      "type": "Select",
+                      "inputs": {
+                        "from": "@body('Keep_Only_Source_Members')",
+                        "select": "@item()?['id']"
+                      },
+                      "runAfter": {
+                        "Keep_Only_Source_Members": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Add_To_Active_Ids": {
+                      "type": "AppendToStringVariable",
+                      "inputs": {
+                        "name": "activeIds",
+                        "value": "@concat(join(body('Select_Active_Ids'), ','), ',')"
+                      },
+                      "runAfter": {
+                        "Select_Active_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Set_Next_Active_Page": {
+                      "type": "SetVariable",
+                      "inputs": {
+                        "name": "nextActive",
+                        "value": "@coalesce(body('Get_Active_Page')?['@odata.nextLink'], '')"
+                      },
+                      "runAfter": {
+                        "Add_To_Active_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Step1_Read_Source_Group_Members": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Step2b_Add_Recently_Created_Users": {
+                  "type": "Until",
+                  "expression": "@equals(variables('nextNew'), '')",
+                  "limit": {
+                    "count": 500,
+                    "timeout": "PT2H"
+                  },
+                  "actions": {
+                    "Get_New_Page": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "GET",
+                        "uri": "@variables('nextNew')",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://graph.microsoft.com"
+                        },
+                        "retryPolicy": {
+                          "type": "exponential",
+                          "count": 5,
+                          "interval": "PT20S",
+                          "minimumInterval": "PT10S",
+                          "maximumInterval": "PT5M"
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Keep_New_Source_Members": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@coalesce(body('Get_New_Page')?['value'], createArray())",
+                        "where": "@and(contains(variables('sourceList'), concat(',', item()?['id'], ',')), not(contains(variables('activeIds'), concat(',', item()?['id'], ','))))"
+                      },
+                      "runAfter": {
+                        "Get_New_Page": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Select_New_Ids": {
+                      "type": "Select",
+                      "inputs": {
+                        "from": "@body('Keep_New_Source_Members')",
+                        "select": "@item()?['id']"
+                      },
+                      "runAfter": {
+                        "Keep_New_Source_Members": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Add_To_Active_Ids_New": {
+                      "type": "AppendToStringVariable",
+                      "inputs": {
+                        "name": "activeIds",
+                        "value": "@concat(join(body('Select_New_Ids'), ','), ',')"
+                      },
+                      "runAfter": {
+                        "Select_New_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Set_Next_New_Page": {
+                      "type": "SetVariable",
+                      "inputs": {
+                        "name": "nextNew",
+                        "value": "@coalesce(body('Get_New_Page')?['@odata.nextLink'], '')"
+                      },
+                      "runAfter": {
+                        "Add_To_Active_Ids_New": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Step2_Read_Recently_Active_Users": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Step3_Read_Target_Group_Members": {
+                  "type": "Until",
+                  "expression": "@equals(variables('nextTarget'), '')",
+                  "limit": {
+                    "count": 200,
+                    "timeout": "PT2H"
+                  },
+                  "actions": {
+                    "Get_Target_Page": {
+                      "type": "Http",
+                      "inputs": {
+                        "method": "GET",
+                        "uri": "@variables('nextTarget')",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://graph.microsoft.com"
+                        },
+                        "retryPolicy": {
+                          "type": "exponential",
+                          "count": 5,
+                          "interval": "PT20S",
+                          "minimumInterval": "PT10S",
+                          "maximumInterval": "PT5M"
+                        },
+                        "headers": {
+                          "ConsistencyLevel": "eventual"
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Select_Target_Ids": {
+                      "type": "Select",
+                      "inputs": {
+                        "from": "@coalesce(body('Get_Target_Page')?['value'], createArray())",
+                        "select": "@item()?['id']"
+                      },
+                      "runAfter": {
+                        "Get_Target_Page": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Add_To_Current_Members": {
+                      "type": "AppendToStringVariable",
+                      "inputs": {
+                        "name": "currentMembers",
+                        "value": "@concat(join(body('Select_Target_Ids'), ','), ',')"
+                      },
+                      "runAfter": {
+                        "Select_Target_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Set_Next_Target_Page": {
+                      "type": "SetVariable",
+                      "inputs": {
+                        "name": "nextTarget",
+                        "value": "@coalesce(body('Get_Target_Page')?['@odata.nextLink'], '')"
+                      },
+                      "runAfter": {
+                        "Add_To_Current_Members": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Step2b_Add_Recently_Created_Users": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Step4_Work_Out_Changes": {
+                  "type": "Scope",
+                  "actions": {
+                    "Source_Ids": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@split(variables('sourceList'), ',')",
+                        "where": "@not(equals(item(), ''))"
+                      },
+                      "runAfter": {}
+                    },
+                    "Active_Ids": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@split(variables('activeIds'), ',')",
+                        "where": "@not(equals(item(), ''))"
+                      },
+                      "runAfter": {
+                        "Source_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Current_Ids": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@split(variables('currentMembers'), ',')",
+                        "where": "@not(equals(item(), ''))"
+                      },
+                      "runAfter": {
+                        "Active_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Users_To_Add": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@body('Active_Ids')",
+                        "where": "@not(contains(variables('currentMembers'), concat(',', item(), ',')))"
+                      },
+                      "runAfter": {
+                        "Current_Ids": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Users_To_Remove": {
+                      "type": "Query",
+                      "inputs": {
+                        "from": "@body('Current_Ids')",
+                        "where": "@not(contains(variables('activeIds'), concat(',', item(), ',')))"
+                      },
+                      "runAfter": {
+                        "Users_To_Add": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Max_Removals_Allowed": {
+                      "type": "Compose",
+                      "inputs": "@max(1, div(mul(length(body('Current_Ids')), parameters('maxRemovalPercent')), 100))",
+                      "runAfter": {
+                        "Users_To_Remove": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Look_Up_Added_Users": {
+                      "type": "Foreach",
+                      "foreach": "@chunk(take(body('Users_To_Add'), 2000), 20)",
+                      "actions": {
+                        "Build_Lookups_Added": {
+                          "type": "Select",
+                          "inputs": {
+                            "from": "@item()",
+                            "select": {
+                              "id": "@item()",
+                              "method": "GET",
+                              "url": "@concat('/users/', item(), '?$select=id,userPrincipalName,displayName,signInActivity')"
+                            }
+                          },
+                          "runAfter": {}
+                        },
+                        "Get_Details_Added": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "POST",
+                            "uri": "https://graph.microsoft.com/v1.0/$batch",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "retryPolicy": {
+                              "type": "exponential",
+                              "count": 5,
+                              "interval": "PT20S",
+                              "minimumInterval": "PT10S",
+                              "maximumInterval": "PT5M"
+                            },
+                            "body": {
+                              "requests": "@body('Build_Lookups_Added')"
+                            }
+                          },
+                          "runAfter": {
+                            "Build_Lookups_Added": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Detail_Lines_Added": {
+                          "type": "Select",
+                          "inputs": {
+                            "from": "@coalesce(body('Get_Details_Added')?['responses'], createArray())",
+                            "select": "@concat(if(parameters('dryRun'), 'WouldAdd', 'Added'), ',\"', replace(coalesce(coalesce(item()?['body']?['userPrincipalName'], item()?['id']), ''), '\"', '\"\"'), '\",\"', replace(coalesce(item()?['body']?['displayName'], ''), '\"', '\"\"'), '\",\"', coalesce(item()?['body']?['signInActivity']?['lastSignInDateTime'], ''), '\"')"
+                          },
+                          "runAfter": {
+                            "Get_Details_Added": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Append_Added_Rows": {
+                          "type": "AppendToStringVariable",
+                          "inputs": {
+                            "name": "addedRows",
+                            "value": "@concat(join(body('Detail_Lines_Added'), decodeUriComponent('%0A')), decodeUriComponent('%0A'))"
+                          },
+                          "runAfter": {
+                            "Detail_Lines_Added": [
+                              "Succeeded"
+                            ]
+                          }
+                        }
+                      },
+                      "runtimeConfiguration": {
+                        "concurrency": {
+                          "repetitions": 1
+                        }
+                      },
+                      "runAfter": {
+                        "Max_Removals_Allowed": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Look_Up_Removed_Users": {
+                      "type": "Foreach",
+                      "foreach": "@chunk(take(body('Users_To_Remove'), 2000), 20)",
+                      "actions": {
+                        "Build_Lookups_Removed": {
+                          "type": "Select",
+                          "inputs": {
+                            "from": "@item()",
+                            "select": {
+                              "id": "@item()",
+                              "method": "GET",
+                              "url": "@concat('/users/', item(), '?$select=id,userPrincipalName,displayName,signInActivity')"
+                            }
+                          },
+                          "runAfter": {}
+                        },
+                        "Get_Details_Removed": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "POST",
+                            "uri": "https://graph.microsoft.com/v1.0/$batch",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "retryPolicy": {
+                              "type": "exponential",
+                              "count": 5,
+                              "interval": "PT20S",
+                              "minimumInterval": "PT10S",
+                              "maximumInterval": "PT5M"
+                            },
+                            "body": {
+                              "requests": "@body('Build_Lookups_Removed')"
+                            }
+                          },
+                          "runAfter": {
+                            "Build_Lookups_Removed": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Detail_Lines_Removed": {
+                          "type": "Select",
+                          "inputs": {
+                            "from": "@coalesce(body('Get_Details_Removed')?['responses'], createArray())",
+                            "select": "@concat(if(parameters('dryRun'), 'WouldRemove', if(greater(length(body('Users_To_Remove')), outputs('Max_Removals_Allowed')), 'BlockedByCap', 'Removed')), ',\"', replace(coalesce(coalesce(item()?['body']?['userPrincipalName'], item()?['id']), ''), '\"', '\"\"'), '\",\"', replace(coalesce(item()?['body']?['displayName'], ''), '\"', '\"\"'), '\",\"', coalesce(item()?['body']?['signInActivity']?['lastSignInDateTime'], ''), '\"')"
+                          },
+                          "runAfter": {
+                            "Get_Details_Removed": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Append_Removed_Rows": {
+                          "type": "AppendToStringVariable",
+                          "inputs": {
+                            "name": "removedRows",
+                            "value": "@concat(join(body('Detail_Lines_Removed'), decodeUriComponent('%0A')), decodeUriComponent('%0A'))"
+                          },
+                          "runAfter": {
+                            "Detail_Lines_Removed": [
+                              "Succeeded"
+                            ]
+                          }
+                        }
+                      },
+                      "runtimeConfiguration": {
+                        "concurrency": {
+                          "repetitions": 1
+                        }
+                      },
+                      "runAfter": {
+                        "Look_Up_Added_Users": [
+                          "Succeeded"
+                        ]
+                      }
+                    },
+                    "Report_Csv": {
+                      "type": "Compose",
+                      "inputs": "@concat(uriComponentToString('%EF%BB%BF'), 'Action,UserPrincipalName,DisplayName,LastSignIn', decodeUriComponent('%0A'), variables('addedRows'), variables('removedRows'))",
+                      "runAfter": {
+                        "Look_Up_Removed_Users": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Step3_Read_Target_Group_Members": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Step5_Apply_Changes": {
+                  "type": "If",
+                  "expression": "@not(parameters('dryRun'))",
+                  "actions": {
+                    "Add_Users": {
+                      "type": "Foreach",
+                      "foreach": "@chunk(body('Users_To_Add'), 20)",
+                      "actions": {
+                        "Build_Add_Requests": {
+                          "type": "Select",
+                          "inputs": {
+                            "from": "@item()",
+                            "select": {
+                              "id": "@item()",
+                              "method": "POST",
+                              "url": "@concat('/groups/', parameters('activeGroupId'), '/members/$ref')",
+                              "headers": {
+                                "Content-Type": "application/json"
+                              },
+                              "body": {
+                                "@@odata.id": "https://graph.microsoft.com/v1.0/directoryObjects/@{item()}"
+                              }
+                            }
+                          },
+                          "runAfter": {}
+                        },
+                        "Batch_Add": {
+                          "type": "Http",
+                          "inputs": {
+                            "method": "POST",
+                            "uri": "https://graph.microsoft.com/v1.0/$batch",
+                            "authentication": {
+                              "type": "ManagedServiceIdentity",
+                              "audience": "https://graph.microsoft.com"
+                            },
+                            "retryPolicy": {
+                              "type": "exponential",
+                              "count": 5,
+                              "interval": "PT20S",
+                              "minimumInterval": "PT10S",
+                              "maximumInterval": "PT5M"
+                            },
+                            "body": {
+                              "requests": "@body('Build_Add_Requests')"
+                            }
+                          },
+                          "runAfter": {
+                            "Build_Add_Requests": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Failed_Add": {
+                          "type": "Query",
+                          "inputs": {
+                            "from": "@coalesce(body('Batch_Add')?['responses'], createArray())",
+                            "where": "@greaterOrEquals(item()?['status'], 400)"
+                          },
+                          "runAfter": {
+                            "Batch_Add": [
+                              "Succeeded"
+                            ]
+                          }
+                        },
+                        "Count_Failed_Add": {
+                          "type": "IncrementVariable",
+                          "inputs": {
+                            "name": "failedChanges",
+                            "value": "@length(body('Failed_Add'))"
+                          },
+                          "runAfter": {
+                            "Failed_Add": [
+                              "Succeeded"
+                            ]
+                          }
+                        }
+                      },
+                      "runtimeConfiguration": {
+                        "concurrency": {
+                          "repetitions": 1
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Remove_Users_If_Under_Cap": {
+                      "type": "If",
+                      "expression": "@lessOrEquals(length(body('Users_To_Remove')), outputs('Max_Removals_Allowed'))",
+                      "actions": {
+                        "Remove_Users": {
+                          "type": "Foreach",
+                          "foreach": "@chunk(body('Users_To_Remove'), 20)",
+                          "actions": {
+                            "Build_Remove_Requests": {
+                              "type": "Select",
+                              "inputs": {
+                                "from": "@item()",
+                                "select": {
+                                  "id": "@item()",
+                                  "method": "DELETE",
+                                  "url": "@concat('/groups/', parameters('activeGroupId'), '/members/', item(), '/$ref')"
+                                }
+                              },
+                              "runAfter": {}
+                            },
+                            "Batch_Remove": {
+                              "type": "Http",
+                              "inputs": {
+                                "method": "POST",
+                                "uri": "https://graph.microsoft.com/v1.0/$batch",
+                                "authentication": {
+                                  "type": "ManagedServiceIdentity",
+                                  "audience": "https://graph.microsoft.com"
+                                },
+                                "retryPolicy": {
+                                  "type": "exponential",
+                                  "count": 5,
+                                  "interval": "PT20S",
+                                  "minimumInterval": "PT10S",
+                                  "maximumInterval": "PT5M"
+                                },
+                                "body": {
+                                  "requests": "@body('Build_Remove_Requests')"
+                                }
+                              },
+                              "runAfter": {
+                                "Build_Remove_Requests": [
+                                  "Succeeded"
+                                ]
+                              }
+                            },
+                            "Failed_Remove": {
+                              "type": "Query",
+                              "inputs": {
+                                "from": "@coalesce(body('Batch_Remove')?['responses'], createArray())",
+                                "where": "@greaterOrEquals(item()?['status'], 400)"
+                              },
+                              "runAfter": {
+                                "Batch_Remove": [
+                                  "Succeeded"
+                                ]
+                              }
+                            },
+                            "Count_Failed_Remove": {
+                              "type": "IncrementVariable",
+                              "inputs": {
+                                "name": "failedChanges",
+                                "value": "@length(body('Failed_Remove'))"
+                              },
+                              "runAfter": {
+                                "Failed_Remove": [
+                                  "Succeeded"
+                                ]
+                              }
+                            }
+                          },
+                          "runtimeConfiguration": {
+                            "concurrency": {
+                              "repetitions": 1
+                            }
+                          },
+                          "runAfter": {}
+                        }
+                      },
+                      "runAfter": {
+                        "Add_Users": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Step4_Work_Out_Changes": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Step6_Send_Summary_Email": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "https://graph.microsoft.com/v1.0/users/@{parameters('senderMailbox')}/sendMail",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://graph.microsoft.com"
+                    },
+                    "retryPolicy": {
+                      "type": "exponential",
+                      "count": 5,
+                      "interval": "PT20S",
+                      "minimumInterval": "PT10S",
+                      "maximumInterval": "PT5M"
+                    },
+                    "body": {
+                      "message": {
+                        "subject": "@concat('Active-Users-60d nightly sync', if(parameters('dryRun'), ' (DRY RUN)', ''), if(greater(length(body('Users_To_Remove')), outputs('Max_Removals_Allowed')), ' - REMOVAL CAP EXCEEDED', ''))",
+                        "body": {
+                          "contentType": "HTML",
+                          "content": "@concat('<h3>Active-Users-60d nightly sync</h3>', if(greater(length(body('Users_To_Remove')), outputs('Max_Removals_Allowed')), concat('<p style=\"color:#b00;font-weight:bold\">REMOVAL CAP EXCEEDED: ', string(length(body('Users_To_Remove'))), ' removals requested, cap is ', string(outputs('Max_Removals_Allowed')), '. Nobody was removed this run.</p>'), ''), '<ul><li>Dry run: ', string(parameters('dryRun')), '</li>', '<li>Source group members: ', string(length(body('Source_Ids'))), '</li>', '<li>Active in last ', string(parameters('inactivityDays')), ' days (in source group): ',         string(length(body('Active_Ids'))), '</li>', '<li>Target group members before run: ', string(length(body('Current_Ids'))), '</li>', '<li>', if(parameters('dryRun'), 'Would add: ', 'Added: '), string(length(body('Users_To_Add'))), '</li>', '<li>', if(parameters('dryRun'), 'Would remove: ', 'Removed: '), string(if(greater(length(body('Users_To_Remove')), outputs('Max_Removals_Allowed')), 0, length(body('Users_To_Remove')))), '</li></ul><p>Details (UPN, display name, last sign-in) are in the attached CSV.</p>', if(parameters('dryRun'), '', concat('<p>Failed changes (will be retried next run): ', string(variables('failedChanges')), '</p>')), if(or(greater(length(body('Users_To_Remove')), 2000), greater(length(body('Users_To_Add')), 2000)), '<p>The CSV lists only the first 2000 adds and the first 2000 removals.</p>', ''))"
+                        },
+                        "toRecipients": [
+                          {
+                            "emailAddress": {
+                              "address": "@parameters('notifyEmail')"
+                            }
+                          }
+                        ],
+                        "attachments": [
+                          {
+                            "@@odata.type": "#microsoft.graph.fileAttachment",
+                            "name": "@concat('active-users-sync-', formatDateTime(utcNow(), 'yyyy-MM-dd'), '.csv')",
+                            "contentType": "text/csv",
+                            "contentBytes": "@base64(outputs('Report_Csv'))"
+                          }
+                        ]
+                      },
+                      "saveToSentItems": false
+                    }
+                  },
+                  "runAfter": {
+                    "Step5_Apply_Changes": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "runAfter": {
+                "Initialize_variables": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Scope_Catch": {
+              "type": "Scope",
+              "actions": {
+                "Send_Failure_Email": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "https://graph.microsoft.com/v1.0/users/@{parameters('senderMailbox')}/sendMail",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "https://graph.microsoft.com"
+                    },
+                    "retryPolicy": {
+                      "type": "exponential",
+                      "count": 5,
+                      "interval": "PT20S",
+                      "minimumInterval": "PT10S",
+                      "maximumInterval": "PT5M"
+                    },
+                    "body": {
+                      "message": {
+                        "subject": "Active-Users-60d nightly sync FAILED",
+                        "body": {
+                          "contentType": "HTML",
+                          "content": "@concat('<p>Run <b>', workflow()['run']['name'], '</b> of Logic App <b>', workflow()['name'], '</b> failed. Open the run history in the Azure portal to see the failed step.</p>')"
+                        },
+                        "toRecipients": [
+                          {
+                            "emailAddress": {
+                              "address": "@parameters('notifyEmail')"
+                            }
+                          }
+                        ]
+                      },
+                      "saveToSentItems": false
+                    }
+                  },
+                  "runAfter": {}
+                },
+                "Terminate_Failed": {
+                  "type": "Terminate",
+                  "inputs": {
+                    "runStatus": "Failed",
+                    "runError": {
+                      "code": "NightlySyncFailed",
+                      "message": "See Scope_Try for the failed action."
+                    }
+                  },
+                  "runAfter": {
+                    "Send_Failure_Email": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "runAfter": {
+                "Scope_Try": [
+                  "Failed",
+                  "TimedOut"
+                ]
+              }
+            }
+          },
+          "outputs": {}
+        },
+        "parameters": {
+          "sourceGroupId": {
+            "value": "[parameters('sourceGroupId')]"
+          },
+          "activeGroupId": {
+            "value": "[parameters('activeGroupId')]"
+          },
+          "senderMailbox": {
+            "value": "[parameters('senderMailbox')]"
+          },
+          "notifyEmail": {
+            "value": "[parameters('notifyEmail')]"
+          },
+          "inactivityDays": {
+            "value": "[parameters('inactivityDays')]"
+          },
+          "dryRun": {
+            "value": "[parameters('dryRun')]"
+          },
+          "maxRemovalPercent": {
+            "value": "[parameters('maxRemovalPercent')]"
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "logicAppPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'Full').identity.principalId]"
+    }
+  }
+}
