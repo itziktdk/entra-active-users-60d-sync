@@ -49,9 +49,9 @@ Roles can take up to a few minutes to apply. Then enable the Logic App.
 
 1. Leave `dryRun = true` for about a week. Review the CSV in each morning's email: the adds and removals should match what you expect.
 2. Check the removal cap suits the group size (a cap of 10% of 1,000 users = 100 removals per night).
-3. Logic App > **Parameters** (designer) > set `dryRun` to `false` and save. Or redeploy with `dryRun=false`.
+3. Logic App > **Logic app code view** > set the `dryRun` default value to `false` and save. Or redeploy with `dryRun=false`.
 
-Changing a setting later: Logic App > Logic app designer > **Parameters**. Redeploying the template overwrites them with the values you pass.
+Changing a setting later: Logic App > **Logic app code view** > in the `parameters` block at the top, edit the `defaultValue` of the setting (for example `dryRun`) and save. The designer's **Parameters** pane edits the same value. Redeploying the template overwrites the settings with the values you pass, and `state` defaults to `Disabled`, so pass `state=Enabled` on a redeploy.
 
 ## Flow diagrams
 

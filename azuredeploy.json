@@ -117,31 +117,31 @@
           "parameters": {
             "sourceGroupId": {
               "type": "string",
-              "defaultValue": "00000000-0000-0000-0000-000000000000"
+              "defaultValue": "[parameters('sourceGroupId')]"
             },
             "activeGroupId": {
               "type": "string",
-              "defaultValue": "00000000-0000-0000-0000-000000000000"
+              "defaultValue": "[parameters('activeGroupId')]"
             },
             "senderMailbox": {
               "type": "string",
-              "defaultValue": "sender@contoso.com"
+              "defaultValue": "[parameters('senderMailbox')]"
             },
             "notifyEmail": {
               "type": "string",
-              "defaultValue": "admins@contoso.com"
+              "defaultValue": "[parameters('notifyEmail')]"
             },
             "inactivityDays": {
               "type": "int",
-              "defaultValue": 60
+              "defaultValue": "[parameters('inactivityDays')]"
             },
             "dryRun": {
               "type": "bool",
-              "defaultValue": true
+              "defaultValue": "[parameters('dryRun')]"
             },
             "maxRemovalPercent": {
               "type": "int",
-              "defaultValue": 10
+              "defaultValue": "[parameters('maxRemovalPercent')]"
             }
           },
           "triggers": {
@@ -1065,29 +1065,6 @@
             }
           },
           "outputs": {}
-        },
-        "parameters": {
-          "sourceGroupId": {
-            "value": "[parameters('sourceGroupId')]"
-          },
-          "activeGroupId": {
-            "value": "[parameters('activeGroupId')]"
-          },
-          "senderMailbox": {
-            "value": "[parameters('senderMailbox')]"
-          },
-          "notifyEmail": {
-            "value": "[parameters('notifyEmail')]"
-          },
-          "inactivityDays": {
-            "value": "[parameters('inactivityDays')]"
-          },
-          "dryRun": {
-            "value": "[parameters('dryRun')]"
-          },
-          "maxRemovalPercent": {
-            "value": "[parameters('maxRemovalPercent')]"
-          }
         }
       }
     }
